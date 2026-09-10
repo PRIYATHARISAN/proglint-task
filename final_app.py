@@ -44,10 +44,12 @@ def get_video_path():
     return "longvid1.mp4"
 
 
-def detect_bags(obj_pred, class_names):
-    """Extract bag detections (boxes and tracker IDs) from YOLO output."""
+def detect_objects(obj_pred, class_names):
+    """Extract bag and person detections from YOLO output."""
     bags = []
+    persons = []
     bag_labels = {"bag", "backpack", "handbag", "suitcase", "luggage"}
+    person_labels = {"person", "human"}
 
     if obj_pred.boxes is not None and len(obj_pred.boxes) > 0:
         boxes = obj_pred.boxes.xyxy.cpu().numpy()
@@ -62,8 +64,10 @@ def detect_bags(obj_pred, class_names):
             name = str(class_names.get(cls_id, cls_id)).lower()
             if name in bag_labels:
                 bags.append({"id": int(obj_id), "box": box})
+            elif name in person_labels:
+                persons.append({"id": int(obj_id), "box": box})
 
-    return bags
+    return bags, persons
 
 
 def get_global_wrists(pose_pred, min_conf=0.3):
@@ -201,8 +205,23 @@ def main():
         obj_pred = obj_results[0]
         pose_pred = pose_results[0]
 
-        bags = detect_bags(obj_pred, object_model.names)
+        bags, persons = detect_objects(obj_pred, object_model.names)
         all_wrists = get_global_wrists(pose_pred)
+
+        # Draw Person Bounding Boxes
+        for person in persons:
+            px1, py1, px2, py2 = person["box"].astype(int)
+            pid = person["id"]
+            cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 200, 0), 2)
+            cv2.putText(
+                frame,
+                f"Person {pid}",
+                (px1, max(py1 - 8, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 200, 0),
+                2,
+            )
 
         # Draw detected wrists once per frame
         for hand in all_wrists:
