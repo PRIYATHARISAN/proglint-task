@@ -6,9 +6,11 @@ __pycache__/
 .vscode/
 .DS_Store
 *.mp4
+*.gguf
 
 # Keep model files required for the project
 !yolo11s-pose.pt
 !runs/
 !runs/**/
 !runs/**/weights/*.pt
+.aider*
