@@ -10,19 +10,15 @@ from ultralytics import YOLO
 def load_models():
     """Load object detection and pose estimation models."""
     model_candidates = [
-        "runs/detect/custom_bag_chair_model-3/weights/best.pt",
         "yolo11l.pt",
-        "yolov8n.pt",
     ]
-    # Pick first available candidate or default to yolo11l.pt / yolov8n.pt
-    model_path = next((p for p in model_candidates if os.path.exists(p)), "yolov8n.pt")
+    model_path = model_candidates[0]
 
     print(f"Loading object model from: {model_path}")
     object_model = YOLO(model_path)
 
-    pose_candidates = ["yolo11s-pose.pt", "yolov8n-pose.pt"]
-    pose_path = next((p for p in pose_candidates if os.path.exists(p)), "yolov8n-pose.pt")
-    
+    # Pose estimation model for wrist tracking
+    pose_path = "yolo11s-pose.pt"
     print(f"Loading pose model from: {pose_path}")
     pose_model = YOLO(pose_path)
 
@@ -34,12 +30,14 @@ def get_video_path():
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
         return sys.argv[1]
 
-    video_candidates = ["longvid1.mp4", "1000093579.mp4"]
+    video_candidates = ["longvid3mp4",]
     for candidate in video_candidates:
         if os.path.exists(candidate):
             return candidate
 
-    mp4_files = [f for f in os.listdir(".") if f.endswith(".mp4") and not f.startswith("output_")]
+    mp4_files = [
+        f for f in os.listdir(".") if f.endswith(".mp4") and not f.startswith("output_")
+    ]
     if mp4_files:
         return mp4_files[0]
 
@@ -55,7 +53,6 @@ def detect_bags(obj_pred, class_names):
         boxes = obj_pred.boxes.xyxy.cpu().numpy()
         classes = obj_pred.boxes.cls.cpu().numpy().astype(int)
 
-        # Retrieve tracking IDs if tracking is active; otherwise assign placeholder IDs
         if obj_pred.boxes.id is not None:
             ids = obj_pred.boxes.id.cpu().numpy().astype(int)
         else:
@@ -70,7 +67,7 @@ def detect_bags(obj_pred, class_names):
 
 
 def get_global_wrists(pose_pred, min_conf=0.3):
-    """Extract left and right wrist keypoints with basic confidence filtering."""
+    """Extract left and right wrist keypoints with confidence filtering."""
     wrists = []
     if pose_pred.keypoints is not None and len(pose_pred.keypoints.xy) > 0:
         skeletons = pose_pred.keypoints.xy.cpu().numpy()
@@ -128,11 +125,11 @@ def is_hand_near_bag(bag_box, wrists):
 def update_bag_state_machine(bag_tracker, bag_box, roi_box, wrists):
     """
     Sequential 4-Phase Transition Machine:
-      - INITIAL: Bag sits inside ROI.
-      - PICKING: Wrist + Bag detected inside ROI (grasping/lifting).
-      - PICKED: Wrist + Bag moved completely out of the ROI.
+      - INITIAL: Bag rests inside ROI.
+      - PICKING: Wrist + Bag detected inside ROI.
+      - PICKED: Wrist + Bag move out of the ROI.
       - PLACING: Wrist + Bag re-enter the ROI area after being PICKED.
-      - PLACED: Bag stays inside ROI while wrists retract/exit.
+      - PLACED: Bag inside ROI while wrist leaves/retracts.
     """
     bx1, by1, bx2, by2 = bag_box
     bag_center = ((bx1 + bx2) / 2, (by1 + by2) / 2)
@@ -151,24 +148,20 @@ def update_bag_state_machine(bag_tracker, bag_box, roi_box, wrists):
 
     def update_counter(name, active):
         frame_counters[name] = frame_counters[name] + 1 if active else 0
-        return frame_counters[name] >= 3  # Stable for at least 3 consecutive frames
+        return frame_counters[name] >= 3  # Frame buffer debounce
 
     current_state = bag_tracker["state"]
 
     if current_state in ("INITIAL", "PLACED"):
-        # Transition to PICKING if hand grabs bag in ROI
         if update_counter("picking", cond_picking):
             bag_tracker["state"] = "PICKING"
     elif current_state == "PICKING":
-        # Transition to PICKED once both have departed ROI
         if update_counter("picked", cond_picked):
             bag_tracker["state"] = "PICKED"
     elif current_state == "PICKED":
-        # Transition to PLACING once bag and hand re-enter ROI
         if update_counter("placing", cond_placing):
             bag_tracker["state"] = "PLACING"
     elif current_state == "PLACING":
-        # Transition to PLACED once hand releases bag in ROI
         if update_counter("placed", cond_placed):
             bag_tracker["state"] = "PLACED"
 
@@ -187,7 +180,6 @@ def main():
         print(f"Failed to open video source: {video_path}")
         return
 
-    # Track state history and ROI coordinates per bag ID
     bag_records = {}
 
     color_map = {
@@ -203,7 +195,6 @@ def main():
         if not success:
             break
 
-        # Run detection and tracking
         obj_results = object_model.track(frame, persist=True, device=device, verbose=False)
         pose_results = pose_model(frame, device=device, verbose=False)
 
@@ -252,7 +243,7 @@ def main():
             cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 128, 0), 2)
             cv2.putText(
                 frame,
-                f"Bag {bag_id} ROI",
+                "ROI",
                 (rx1, max(ry1 - 8, 15)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -272,7 +263,7 @@ def main():
                 2,
             )
 
-        # Render preview
+        # Display output
         resized = cv2.resize(frame, (960, 540))
         cv2.imshow("Activity State Machine", resized)
 
