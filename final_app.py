@@ -5,13 +5,24 @@ import numpy as np
 from ultralytics import YOLO
 
 def load_models():
-    model_path = "runs/detect/custom_bag_chair_model-3/weights/best.pt"
-    if not os.path.exists(model_path):
-        model_path = "yolov11l.pt"
+    model_candidates = [
+        "runs/detect/custom_bag_chair_model-3/weights/best.pt",
+        "yolov11l.pt",
+    ]
+    model_path = next((p for p in model_candidates if os.path.exists(p)), model_candidates[-1])
 
     object_model = YOLO(model_path)
     pose_model = YOLO("yolo11s-pose.pt")
     return object_model, pose_model
+
+
+def get_video_path():
+    video_candidates = [
+        "1000093579.mp4",
+        "1000093632.mp4",
+        "1000093653.mp4",
+    ]
+    return next((p for p in video_candidates if os.path.exists(p)), video_candidates[0])
 
 def calculate_chair_overlap(bag_box, chair_box):
     bx1, by1, bx2, by2 = bag_box
@@ -33,9 +44,17 @@ def calculate_chair_overlap(bag_box, chair_box):
 
     return intersection_area / bag_area
 
-def detect_objects(obj_pred):
+def detect_objects(obj_pred, class_names):
+    """Return bags and chairs without relying on a fixed class-id order.
+
+    The custom model uses ``bag``/``chair`` names, while the fallback COCO
+    model uses names such as ``backpack`` and ``handbag``.  Looking up the
+    class name makes both models work correctly.
+    """
     seating_boxes = []
     bags = []
+    bag_names = {"bag", "backpack", "handbag", "suitcase", "luggage"}
+    chair_names = {"chair", "seat", "seating"}
 
     if obj_pred.boxes is not None and len(obj_pred.boxes) > 0:
         boxes = obj_pred.boxes.xyxy.cpu().numpy()
@@ -47,9 +66,10 @@ def detect_objects(obj_pred):
             ids = np.array([999] * len(boxes))
 
         for box, cls_id, obj_id in zip(boxes, classes, ids):
-            if cls_id == 1:
+            class_name = str(class_names.get(cls_id, cls_id)).lower()
+            if class_name in chair_names:
                 seating_boxes.append(box)
-            elif cls_id == 0:
+            elif class_name in bag_names:
                 bags.append({"id": obj_id, "box": box})
 
     return seating_boxes, bags
@@ -72,9 +92,68 @@ def point_inside_box(point, box):
     x1, y1, x2, y2 = box
     return x1 <= x <= x2 and y1 <= y <= y2
 
+
+def is_hand_near_bag(bag_box, wrists):
+    """Whether a detected wrist is close enough to be handling this bag."""
+    bx1, by1, bx2, by2 = bag_box
+    # Measure from the closest point of the box, not its centre.  A wrist at
+    # the edge of a large bag is still handling it.
+    proximity_threshold = max(60, 0.25 * max(bx2 - bx1, by2 - by1))
+
+    for hand in wrists:
+        for wrist in (hand["left"], hand["right"]):
+            if wrist[0] > 0 and wrist[1] > 0:
+                nearest_x = min(max(wrist[0], bx1), bx2)
+                nearest_y = min(max(wrist[1], by1), by2)
+                if math.dist((wrist[0], wrist[1]), (nearest_x, nearest_y)) <= proximity_threshold:
+                    return True
+    return False
+
+
+def update_bag_state(bag_state, bag_box, seating_boxes, wrists):
+    """Advance a bag through detected -> picking -> picked -> placing -> placed.
+
+    Each condition must hold for three consecutive frames, which prevents a
+    one-frame pose or object detection miss from changing the displayed label.
+    """
+    bx1, by1, bx2, by2 = bag_box
+    bag_center = ((bx1 + bx2) / 2, (by1 + by2) / 2)
+    at_start_position = point_inside_box(bag_center, bag_state["ref_box"])
+    on_chair = any(calculate_chair_overlap(bag_box, chair) >= 0.20 for chair in seating_boxes)
+    hand_near = is_hand_near_bag(bag_box, wrists)
+
+    conditions = {
+        "hand_near": hand_near,
+        "away_with_hand": not at_start_position and hand_near,
+        "on_chair_with_hand": on_chair and hand_near,
+        "on_chair_without_hand": on_chair and not hand_near,
+        "back_at_start_without_hand": at_start_position and not hand_near,
+    }
+    for name, active in conditions.items():
+        bag_state["frames"][name] = bag_state["frames"][name] + 1 if active else 0
+
+    state = bag_state["state"]
+    stable = lambda name: bag_state["frames"][name] >= 3
+
+    if state == "BAG DETECTED" and stable("hand_near"):
+        bag_state["state"] = "PICKING"
+    elif state == "PICKING":
+        if stable("away_with_hand"):
+            bag_state["state"] = "PICKED"
+        elif stable("back_at_start_without_hand"):
+            bag_state["state"] = "BAG DETECTED"
+    elif state == "PICKED" and stable("on_chair_with_hand"):
+        bag_state["state"] = "PLACING"
+    elif state == "PLACING" and stable("on_chair_without_hand"):
+        bag_state["state"] = "PLACED"
+    elif state == "PLACED" and stable("hand_near"):
+        bag_state["state"] = "PICKING"
+
+    return bag_state["state"]
+
 def main():
     object_model, pose_model = load_models()
-    video_path = "1000093653.mp4"
+    video_path = get_video_path()
     video_capture = cv2.VideoCapture(video_path)
 
     if not video_capture.isOpened():
@@ -94,8 +173,16 @@ def main():
         obj_pred = obj_results[0]
         pose_pred = pose_results[0]
 
-        seating_boxes, bags = detect_objects(obj_pred)
+        seating_boxes, bags = detect_objects(obj_pred, object_model.names)
         all_wrists = get_global_wrists(pose_pred)
+
+        # Show detected chairs too, so it is clear which object is used for
+        # the "BAG ON CHAIR" condition.
+        for chair_box in seating_boxes:
+            cx1, cy1, cx2, cy2 = chair_box.astype(int)
+            cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 128, 0), 2)
+            cv2.putText(frame, "CHAIR", (cx1, max(cy1 - 8, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 128, 0), 2)
 
         for bag in bags:
             bag_id = int(bag["id"])
@@ -104,78 +191,28 @@ def main():
             bag_cx = (bx1 + bx2) / 2
             bag_cy = (by1 + by2) / 2
 
-            # Create a fixed ROI only once, when the bag is first detected.
             if bag_id not in bag_states:
                 margin = 25
-                ref_box = [
-                    max(bx1 - margin, 0),
-                    max(by1 - margin, 0),
-                    bx2 + margin,
-                    by2 + margin,
-                ]
                 bag_states[bag_id] = {
-                    "ref_box": ref_box,
+                    "ref_box": [max(bx1 - margin, 0), max(by1 - margin, 0), bx2 + margin, by2 + margin],
                     "state": "BAG DETECTED",
-                    "wrist_inside_frames": 0,
-                    "wrist_outside_frames": 0,
-                    "bag_inside_frames": 0,
-                    "bag_outside_frames": 0,
+                    "frames": {
+                        "hand_near": 0,
+                        "away_with_hand": 0,
+                        "on_chair_with_hand": 0,
+                        "on_chair_without_hand": 0,
+                        "back_at_start_without_hand": 0,
+                    },
                 }
 
-            bag_state = bag_states[bag_id]
-            ref_box = bag_state["ref_box"]
-            rx1, ry1, rx2, ry2 = ref_box
-
-            bag_inside_roi = point_inside_box((bag_cx, bag_cy), ref_box)
-            wrist_inside_roi = any(
-                point_inside_box((wrist_x, wrist_y), ref_box)
-                for hand in all_wrists
-                for wrist_x, wrist_y in (hand["left"], hand["right"])
-                if wrist_x > 0 and wrist_y > 0
-            )
-
-            if bag_inside_roi:
-                bag_state["bag_inside_frames"] += 1
-                bag_state["bag_outside_frames"] = 0
-            else:
-                bag_state["bag_outside_frames"] += 1
-                bag_state["bag_inside_frames"] = 0
-
-            if wrist_inside_roi:
-                bag_state["wrist_inside_frames"] += 1
-                bag_state["wrist_outside_frames"] = 0
-            else:
-                bag_state["wrist_outside_frames"] += 1
-                bag_state["wrist_inside_frames"] = 0
-
-            stable_inside = bag_state["bag_inside_frames"] >= 3
-            stable_outside = bag_state["bag_outside_frames"] >= 3
-            stable_wrist_inside = bag_state["wrist_inside_frames"] >= 3
-            stable_wrist_outside = bag_state["wrist_outside_frames"] >= 3
-
-            if bag_state["state"] == "BAG DETECTED" and stable_wrist_inside:
-                bag_state["state"] = "PICKING"
-            elif bag_state["state"] == "PICKING":
-                if stable_outside and stable_wrist_outside:
-                    bag_state["state"] = "PICKED"
-                elif stable_wrist_outside and stable_inside:
-                    bag_state["state"] = "BAG DETECTED"
-            elif bag_state["state"] == "PICKED" and stable_inside and stable_wrist_inside:
-                bag_state["state"] = "PLACING"
-            elif bag_state["state"] == "PLACING" and stable_inside and stable_wrist_outside:
-                bag_state["state"] = "PLACED"
-
-            label = bag_state["state"]
+            label = update_bag_state(bag_states[bag_id], bag_box, seating_boxes, all_wrists)
             color = {
                 "BAG DETECTED": (0, 0, 255),
                 "PICKING": (0, 165, 255),
                 "PICKED": (0, 255, 0),
                 "PLACING": (255, 0, 255),
-                "PLACED": (0, 255, 0),
+                "PLACED": (255, 255, 0),
             }[label]
-
-            cv2.rectangle(frame, (int(rx1), int(ry1)), (int(rx2), int(ry2)), (255, 128, 0), 1)
-            cv2.putText(frame, "ROI", (int(rx1) + 5, int(ry1) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 128, 0), 1)
 
             cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)), color, 3)
             cv2.putText(
