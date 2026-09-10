@@ -67,9 +67,14 @@ def get_global_wrists(pose_pred):
                 })
     return wrists
 
+def point_inside_box(point, box):
+    x, y = point
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
+
 def main():
     object_model, pose_model = load_models()
-    video_path = "1000093579.mp4"
+    video_path = "1000093653.mp4"
     video_capture = cv2.VideoCapture(video_path)
 
     if not video_capture.isOpened():
@@ -110,37 +115,64 @@ def main():
                 ]
                 bag_states[bag_id] = {
                     "ref_box": ref_box,
-                    "picked": False,
-                    "frames_outside": 0,
+                    "state": "BAG DETECTED",
+                    "wrist_inside_frames": 0,
+                    "wrist_outside_frames": 0,
+                    "bag_inside_frames": 0,
+                    "bag_outside_frames": 0,
                 }
 
-            ref_box = bag_states[bag_id]["ref_box"]
+            bag_state = bag_states[bag_id]
+            ref_box = bag_state["ref_box"]
             rx1, ry1, rx2, ry2 = ref_box
-            roi_cx = (rx1 + rx2) / 2
-            roi_cy = (ry1 + ry2) / 2
-            roi_w = max(rx2 - rx1, 10)
-            roi_h = max(ry2 - ry1, 10)
 
-            # More stable than checking x/y separately.
-            center_dist = math.hypot(bag_cx - roi_cx, bag_cy - roi_cy)
-            move_threshold = 0.5 * max(roi_w, roi_h)
-            bag_outside_roi = center_dist > move_threshold
+            bag_inside_roi = point_inside_box((bag_cx, bag_cy), ref_box)
+            wrist_inside_roi = any(
+                point_inside_box((wrist_x, wrist_y), ref_box)
+                for hand in all_wrists
+                for wrist_x, wrist_y in (hand["left"], hand["right"])
+                if wrist_x > 0 and wrist_y > 0
+            )
 
-            if bag_outside_roi:
-                bag_states[bag_id]["frames_outside"] += 1
+            if bag_inside_roi:
+                bag_state["bag_inside_frames"] += 1
+                bag_state["bag_outside_frames"] = 0
             else:
-                bag_states[bag_id]["frames_outside"] = 0
+                bag_state["bag_outside_frames"] += 1
+                bag_state["bag_inside_frames"] = 0
 
-            # Require a few stable frames before switching to picked-up state.
-            picked_up = bag_states[bag_id]["frames_outside"] >= 3
-            bag_states[bag_id]["picked"] = picked_up
-
-            if picked_up:
-                label = "PICKED UP"
-                color = (0, 255, 0)
+            if wrist_inside_roi:
+                bag_state["wrist_inside_frames"] += 1
+                bag_state["wrist_outside_frames"] = 0
             else:
-                label = "DROPPED / NOT PICKED"
-                color = (0, 0, 255)
+                bag_state["wrist_outside_frames"] += 1
+                bag_state["wrist_inside_frames"] = 0
+
+            stable_inside = bag_state["bag_inside_frames"] >= 3
+            stable_outside = bag_state["bag_outside_frames"] >= 3
+            stable_wrist_inside = bag_state["wrist_inside_frames"] >= 3
+            stable_wrist_outside = bag_state["wrist_outside_frames"] >= 3
+
+            if bag_state["state"] == "BAG DETECTED" and stable_wrist_inside:
+                bag_state["state"] = "PICKING"
+            elif bag_state["state"] == "PICKING":
+                if stable_outside and stable_wrist_outside:
+                    bag_state["state"] = "PICKED"
+                elif stable_wrist_outside and stable_inside:
+                    bag_state["state"] = "BAG DETECTED"
+            elif bag_state["state"] == "PICKED" and stable_inside and stable_wrist_inside:
+                bag_state["state"] = "PLACING"
+            elif bag_state["state"] == "PLACING" and stable_inside and stable_wrist_outside:
+                bag_state["state"] = "PLACED"
+
+            label = bag_state["state"]
+            color = {
+                "BAG DETECTED": (0, 0, 255),
+                "PICKING": (0, 165, 255),
+                "PICKED": (0, 255, 0),
+                "PLACING": (255, 0, 255),
+                "PLACED": (0, 255, 0),
+            }[label]
 
             cv2.rectangle(frame, (int(rx1), int(ry1)), (int(rx2), int(ry2)), (255, 128, 0), 1)
             cv2.putText(frame, "ROI", (int(rx1) + 5, int(ry1) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 128, 0), 1)
